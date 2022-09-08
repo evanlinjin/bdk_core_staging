@@ -281,13 +281,14 @@ fn main() -> anyhow::Result<()> {
             let wv_candidates = candidates
                 .iter()
                 .map(|(plan, utxo)| {
-                    InputCandidate::new(
-                        &cs_opts,
+                    let mut candidate = InputCandidate::new_group(
                         1,
                         utxo.value,
                         TXIN_FIXED_WEIGHT + plan.expected_weight() as u32,
                         plan.witness_version().is_some(),
-                    )
+                    );
+                    candidate.init(&cs_opts);
+                    candidate
                 })
                 .collect();
 

@@ -3,6 +3,56 @@ use bitcoin::{LockTime, Transaction, TxOut};
 
 pub const TXIN_FIXED_WEIGHT: u32 = (32 + 4 + 4) * 4;
 
+/// This is a common structure that is to be shared across all [`Selector`] instances.
+/// This structure should not be mutated after forming.
+#[derive(Debug, Clone)]
+pub struct SelectorCommon {
+    /// Selector options.
+    pub opts: CoinSelectorOpt,
+
+    /// Fixed inputs (if any).
+    pub mandatory: Option<InputCandidate>,
+    /// Input candidates.
+    pub candidates: Vec<InputCandidate>,
+
+    /// Cost of creating change output + cost of spending the change output in the future.
+    /// `change_weight * effective_feerate + spend_change_weight * long_term_feerate`
+    pub cost_of_change: i64,
+
+    /// Effective selection target (we take into consideration the fee required).
+    /// `recipients_sum + fixed_weight * effective_feerate`
+    pub effective_target: i64,
+}
+
+impl SelectorCommon {
+    pub fn new(
+        opts: CoinSelectorOpt,
+        mut mandatory: Option<InputCandidate>,
+        mut candidates: Vec<InputCandidate>,
+    ) -> Self {
+        let cost_of_change = (opts.drain_weight as f32 * opts.effective_feerate
+            + opts.drain_spend_weight as f32 * opts.long_term_feerate)
+            .ceil() as i64;
+        let total_fixed_weight = mandatory.map(|i| i.weight).unwrap_or(0) + opts.fixed_weight;
+        let effective_target = opts.recipients_sum as i64
+            + (total_fixed_weight as f32 * opts.effective_feerate).ceil() as i64;
+
+        // init all input candidates
+        mandatory
+            .iter_mut()
+            .chain(candidates.iter_mut())
+            .for_each(|i| i.init(&opts));
+
+        Self {
+            opts,
+            mandatory,
+            candidates,
+            cost_of_change,
+            effective_target,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CoinSelector<'a> {
     opts: &'a CoinSelectorOpt,
@@ -27,8 +77,8 @@ pub struct SelectedState {
 }
 
 impl SelectedState {
-    pub fn add_candidate(&mut self, opts: &CoinSelectorOpt, candidate: &InputCandidate) {
-        self.waste += candidate.waste(opts);
+    pub fn add_candidate(&mut self, candidate: &InputCandidate) {
+        self.waste += candidate.waste;
         self.value += candidate.value;
         self.value_remaining -= candidate.value;
         self.effective_value += candidate.effective_value;
@@ -40,8 +90,8 @@ impl SelectedState {
         self.weight += candidate.weight;
     }
 
-    pub fn sub_candidate(&mut self, opts: &CoinSelectorOpt, candidate: &InputCandidate) {
-        self.waste -= candidate.waste(opts);
+    pub fn sub_candidate(&mut self, candidate: &InputCandidate) {
+        self.waste -= candidate.waste;
         self.value -= candidate.value;
         self.value_remaining += candidate.value;
         self.effective_value -= candidate.effective_value;
@@ -51,6 +101,10 @@ impl SelectedState {
             self.segwit_count -= 1;
         }
         self.weight -= candidate.weight;
+    }
+
+    pub fn is_segwit(&self) -> bool {
+        self.segwit_count > 0
     }
 }
 
@@ -62,13 +116,49 @@ pub struct InputCandidate {
     pub input_count: usize,
     /// Total value of these input(s).
     pub value: u64,
-    /// This is the input(s) value minus cost of spending these input(s):
-    /// `value - (weight * effective_fee)`
-    pub effective_value: i64,
     /// Weight of these input(s): `prevout + nSequence + scriptSig + scriptWitness` per input.
     pub weight: u32,
     /// Whether at least one input of this [`InputCandidate`] is spending a segwit output.
     pub is_segwit: bool,
+
+    /// This is the input(s) value minus cost of spending these input(s):
+    /// `value - (weight * effective_fee)`
+    effective_value: i64,
+    /// This is the `waste` of including these input(s).
+    /// `weight * (effective_fee - long_term_fee)`
+    waste: i64,
+}
+
+impl InputCandidate {
+    /// New [`InputCandidate`].
+    pub fn new_group(input_count: usize, value: u64, weight: u32, is_segwit: bool) -> Self {
+        assert!(
+            input_count > 0,
+            "InputCandidate does not make sense with 0 inputs"
+        );
+
+        Self {
+            input_count,
+            value,
+            weight,
+            is_segwit,
+
+            // These values are set by `init`
+            effective_value: 0,
+            waste: 0,
+        }
+    }
+
+    pub fn new_single(value: u64, weight: u32, is_segwit: bool) -> Self {
+        Self::new_group(1, value, weight, is_segwit)
+    }
+
+    pub fn init(&mut self, opts: &CoinSelectorOpt) {
+        self.effective_value =
+            self.value as i64 - (self.weight as f32 * opts.effective_feerate).ceil() as i64;
+        self.waste =
+            (self.weight as f32 * (opts.effective_feerate - opts.long_term_feerate)).ceil() as i64;
+    }
 }
 
 #[cfg(feature = "std")]
@@ -79,39 +169,12 @@ impl std::ops::Add for InputCandidate {
         Self {
             input_count: self.input_count + other.input_count,
             value: self.value + other.value,
-            effective_value: self.effective_value + other.effective_value,
             weight: self.weight + other.weight,
             is_segwit: self.is_segwit || other.is_segwit,
-        }
-    }
-}
 
-impl InputCandidate {
-    /// New [`InputCandidate`] where `effective_value` is calculated from fee defined in `opts`.
-    pub fn new(
-        opts: &CoinSelectorOpt,
-        input_count: usize,
-        value: u64,
-        weight: u32,
-        is_segwit: bool,
-    ) -> Self {
-        assert!(
-            input_count > 0,
-            "InputCandidate does not make sense with 0 inputs"
-        );
-        let effective_value = value as i64 - (weight as f32 * opts.effective_feerate).ceil() as i64;
-        Self {
-            input_count,
-            value,
-            effective_value,
-            weight,
-            is_segwit,
+            effective_value: self.effective_value + other.effective_value,
+            waste: self.waste + other.waste,
         }
-    }
-
-    /// Calculates the `waste` of including this input.
-    pub fn waste(&self, opts: &CoinSelectorOpt) -> i64 {
-        (self.weight as f32 * (opts.effective_feerate - opts.long_term_feerate)).ceil() as i64
     }
 }
 
@@ -242,16 +305,14 @@ impl<'a> CoinSelector<'a> {
     pub fn select(&mut self, index: usize) {
         assert!(index < self.candidates.len());
         if self.selected_indexes.insert(index) {
-            self.selected_state
-                .add_candidate(self.opts, &self.candidates[index]);
+            self.selected_state.add_candidate(&self.candidates[index]);
         }
     }
 
     pub fn deselect(&mut self, index: usize) {
         assert!(index < self.candidates.len());
         if self.selected_indexes.remove(&index) {
-            self.selected_state
-                .sub_candidate(self.opts, &self.candidates[index]);
+            self.selected_state.sub_candidate(&self.candidates[index]);
         }
     }
 
