@@ -1,3 +1,5 @@
+use core::cmp::Ordering;
+
 use crate::{collections::BTreeSet, Vec};
 use bitcoin::{LockTime, Transaction, TxOut};
 
@@ -11,9 +13,9 @@ pub struct SelectorCommon {
     pub opts: CoinSelectorOpt,
 
     /// Fixed inputs (if any).
-    pub mandatory: Option<InputCandidate>,
+    pub fixed_inputs: Option<InputGroup>,
     /// Input candidates.
-    pub candidates: Vec<InputCandidate>,
+    pub candidate_inputs: Vec<InputGroup>,
 
     /// Cost of creating change output + cost of spending the change output in the future.
     /// `change_weight * effective_feerate + spend_change_weight * long_term_feerate`
@@ -27,36 +29,235 @@ pub struct SelectorCommon {
 impl SelectorCommon {
     pub fn new(
         opts: CoinSelectorOpt,
-        mut mandatory: Option<InputCandidate>,
-        mut candidates: Vec<InputCandidate>,
+        mut fixed_inputs: Option<InputGroup>,
+        mut candidate_inputs: Vec<InputGroup>,
     ) -> Self {
         let cost_of_change = (opts.drain_weight as f32 * opts.effective_feerate
             + opts.drain_spend_weight as f32 * opts.long_term_feerate)
             .ceil() as i64;
-        let total_fixed_weight = mandatory.map(|i| i.weight).unwrap_or(0) + opts.fixed_weight;
-        let effective_target = opts.recipients_sum as i64
-            + (total_fixed_weight as f32 * opts.effective_feerate).ceil() as i64;
+
+        let (fixed_input_weight, fixed_input_value) =
+            fixed_inputs.map(|i| (i.weight, i.value)).unwrap_or((0, 0));
+
+        let fixed_weight = fixed_input_weight + opts.fixed_weight;
+        let actual_target = opts.recipients_sum as i64 - fixed_input_value as i64;
+
+        let effective_target =
+            actual_target + (fixed_weight as f32 * opts.effective_feerate).ceil() as i64;
 
         // init all input candidates
-        mandatory
+        fixed_inputs
             .iter_mut()
-            .chain(candidates.iter_mut())
+            .chain(candidate_inputs.iter_mut())
             .for_each(|i| i.init(&opts));
 
         Self {
             opts,
-            mandatory,
-            candidates,
+            fixed_inputs,
+            candidate_inputs,
             cost_of_change,
             effective_target,
         }
+    }
+
+    pub fn is_feerate_decreasing(&self) -> bool {
+        self.opts.effective_feerate > self.opts.long_term_feerate
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Selector {
+    candidates: Vec<usize>,
+    selected: BTreeSet<usize>,
+    selected_state: InputGroup,
+}
+
+impl Selector {
+    pub fn new(candidate_count: usize) -> Self {
+        Self {
+            candidates: (0..candidate_count).collect::<Vec<_>>(),
+            selected: BTreeSet::new(),
+            selected_state: InputGroup::empty(),
+        }
+    }
+
+    pub fn new_sorted<F>(common: &SelectorCommon, mut sort: F) -> Self
+    where
+        F: FnMut(&(usize, &InputGroup), &(usize, &InputGroup)) -> Ordering,
+    {
+        let mut selector = Self::new(common.candidate_inputs.len());
+        selector.candidates.sort_unstable_by(|&a, &b| {
+            sort(
+                &(a, &common.candidate_inputs[a]),
+                &(b, &common.candidate_inputs[b]),
+            )
+        });
+        selector
+    }
+
+    pub fn select(&mut self, common: &SelectorCommon, pos: usize) {
+        assert!(pos < self.candidates.len());
+        assert_eq!(self.candidates.len(), common.candidate_inputs.len());
+
+        if self.selected.insert(pos) {
+            let index = self.candidates[pos];
+            self.selected_state
+                .add_with(&common.candidate_inputs[index]);
+        }
+    }
+
+    pub fn select_all(&mut self, common: &SelectorCommon) {
+        (0..self.candidates.len()).for_each(|pos| self.select(common, pos))
+    }
+
+    pub fn deselect(&mut self, common: &SelectorCommon, pos: usize) {
+        assert!(pos < self.candidates.len());
+        assert_eq!(self.candidates.len(), common.candidate_inputs.len());
+
+        if self.selected.remove(&pos) {
+            let index = self.candidates[pos];
+            self.selected_state
+                .sub_with(&common.candidate_inputs[index]);
+        }
+    }
+
+    pub fn last_selected_position(&self) -> Option<usize> {
+        self.selected.iter().last().cloned()
+    }
+
+    pub fn position_selected(&self, pos: usize) -> bool {
+        self.selected.contains(&pos)
+    }
+
+    pub fn count(&self) -> usize {
+        self.selected.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.selected.len() == 0
+    }
+
+    pub fn state(&self) -> &InputGroup {
+        &self.selected_state
+    }
+
+    /// Excess is the difference between selected value and target
+    /// `selected_effective_value - effective_target`
+    pub fn excess(&self, common: &SelectorCommon) -> i64 {
+        self.selected_state.effective_value - common.effective_target
+    }
+
+    pub fn weight(&self, common: &SelectorCommon, include_drain: bool) -> u32 {
+        let has_segwit = self.has_segwit_input(common);
+
+        let extra_witness_weight = if has_segwit { 2_u32 } else { 0_u32 };
+        let extra_varint_weight = self.extra_varint_weight(common);
+        let fixed_inputs_weight = common.fixed_inputs.map(|i| i.weight).unwrap_or(0);
+        let drain_weight = if include_drain {
+            common.opts.drain_weight
+        } else {
+            0
+        };
+
+        common.opts.fixed_weight // fixed outputs and header fields
+            + fixed_inputs_weight // fixed inputs
+            + self.selected_state.weight // selected inputs
+            + drain_weight // drain output(s) (if any)
+            + extra_witness_weight // extra witness headers (if any)
+            + extra_varint_weight // extra input len varint weight (if any)
+    }
+
+    pub fn candidate_count(&self) -> usize {
+        self.candidates.len()
+    }
+
+    pub fn candidate_at<'c>(&self, common: &'c SelectorCommon, pos: usize) -> &'c InputGroup {
+        assert!(pos < self.candidates.len());
+        assert_eq!(self.candidates.len(), common.candidate_inputs.len());
+
+        let index = self.candidates[pos];
+        &common.candidate_inputs[index]
+    }
+
+    /// Whether the current selection (inclusive of fixed inputs) contain at least one segwit input.
+    pub fn has_segwit_input(&self, common: &SelectorCommon) -> bool {
+        let fixed_segwit_count = common.fixed_inputs.map(|i| i.segwit_count).unwrap_or(0);
+        self.selected_state.segwit_count + fixed_segwit_count > 0
+    }
+
+    /// This is the extra weight of the `txin_count` variable (which is a `varint`), when we
+    /// introduce all inputs.
+    pub fn extra_varint_weight(&self, common: &SelectorCommon) -> u32 {
+        let input_count = self.selected_state.input_count
+            + common.fixed_inputs.map(|i| i.input_count).unwrap_or(0);
+
+        varint_size(input_count).saturating_sub(1) * 4
+    }
+
+    pub fn finish(
+        &self,
+        common: &SelectorCommon,
+        min_viable_change: i64, // for BnB: Cost of change
+    ) -> Result<Selection, SelectionFailure> {
+        let fixed_inputs = &common.fixed_inputs.unwrap_or_else(InputGroup::empty);
+        let selected_inputs = self.state();
+
+        let excess = self.excess(common);
+        if excess < 0 {
+            return Err(SelectionFailure::InsufficientFunds {
+                selected: selected_inputs.effective_value as _,
+                needed: common.effective_target as _,
+            });
+        }
+        assert!(selected_inputs.value + fixed_inputs.value > common.opts.recipients_sum);
+
+        // fee of creating change output(s) (not to be mistaken as cost_of_change)
+        let change_fee =
+            (common.opts.drain_weight as f32 * common.opts.effective_feerate).ceil() as i64;
+
+        // find the value that should be used for our change output (if any)
+        let change_value = {
+            let change_value = excess - change_fee;
+            if change_value < min_viable_change {
+                None
+            } else {
+                Some(change_value)
+            }
+        };
+
+        let use_drain = change_value.is_some();
+        let waste = fixed_inputs.waste
+            + selected_inputs.waste
+            + if use_drain {
+                common.opts.drain_cost() as i64
+            } else {
+                excess
+            };
+        let total_weight = self.weight(common, use_drain);
+        let excess = change_value.unwrap_or(excess);
+        let fee = fixed_inputs.value + selected_inputs.value
+            - common.opts.recipients_sum
+            - change_value.unwrap_or(0) as u64;
+
+        Ok(Selection {
+            selected: self
+                .selected
+                .iter()
+                .map(|&pos| self.candidates[pos])
+                .collect(),
+            excess: excess as _,
+            fee,
+            use_drain,
+            total_weight,
+            waste,
+        })
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct CoinSelector<'a> {
     opts: &'a CoinSelectorOpt,
-    candidates: &'a Vec<InputCandidate>,
+    candidates: &'a Vec<InputGroup>,
 
     /* The following fields record the selection state */
     selected_indexes: BTreeSet<usize>, // indexes of selected input candidates
@@ -77,29 +278,25 @@ pub struct SelectedState {
 }
 
 impl SelectedState {
-    pub fn add_candidate(&mut self, candidate: &InputCandidate) {
+    pub fn add_candidate(&mut self, candidate: &InputGroup) {
         self.waste += candidate.waste;
         self.value += candidate.value;
         self.value_remaining -= candidate.value;
         self.effective_value += candidate.effective_value;
         self.effective_value_remaining -= candidate.effective_value;
         self.input_count += candidate.input_count;
-        if candidate.is_segwit {
-            self.segwit_count += 1;
-        }
+        self.segwit_count += candidate.segwit_count;
         self.weight += candidate.weight;
     }
 
-    pub fn sub_candidate(&mut self, candidate: &InputCandidate) {
+    pub fn sub_candidate(&mut self, candidate: &InputGroup) {
         self.waste -= candidate.waste;
         self.value -= candidate.value;
         self.value_remaining += candidate.value;
         self.effective_value -= candidate.effective_value;
         self.effective_value_remaining += candidate.effective_value;
         self.input_count -= candidate.input_count;
-        if candidate.is_segwit {
-            self.segwit_count -= 1;
-        }
+        self.segwit_count -= candidate.segwit_count;
         self.weight -= candidate.weight;
     }
 
@@ -109,17 +306,17 @@ impl SelectedState {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct InputCandidate {
+pub struct InputGroup {
     /// Number of inputs contained within this [`InputCandidate`].
     /// If we are using single UTXOs as candidates, this would be 1.
     /// If we are working in `OutputGroup`s (as done in Bitcoin Core), this would be > 1.
     pub input_count: usize,
+    /// Whether at least one input of this [`InputCandidate`] is spending a segwit output.
+    pub segwit_count: usize,
     /// Total value of these input(s).
     pub value: u64,
     /// Weight of these input(s): `prevout + nSequence + scriptSig + scriptWitness` per input.
     pub weight: u32,
-    /// Whether at least one input of this [`InputCandidate`] is spending a segwit output.
-    pub is_segwit: bool,
 
     /// This is the input(s) value minus cost of spending these input(s):
     /// `value - (weight * effective_fee)`
@@ -129,7 +326,7 @@ pub struct InputCandidate {
     waste: i64,
 }
 
-impl InputCandidate {
+impl InputGroup {
     /// New [`InputCandidate`].
     pub fn new_group(input_count: usize, value: u64, weight: u32, is_segwit: bool) -> Self {
         assert!(
@@ -141,7 +338,7 @@ impl InputCandidate {
             input_count,
             value,
             weight,
-            is_segwit,
+            segwit_count: if is_segwit { 1 } else { 0 },
 
             // These values are set by `init`
             effective_value: 0,
@@ -153,28 +350,42 @@ impl InputCandidate {
         Self::new_group(1, value, weight, is_segwit)
     }
 
+    pub fn empty() -> Self {
+        Self {
+            input_count: 0,
+            segwit_count: 0,
+            value: 0,
+            weight: 0,
+            effective_value: 0,
+            waste: 0,
+        }
+    }
+
     pub fn init(&mut self, opts: &CoinSelectorOpt) {
         self.effective_value =
             self.value as i64 - (self.weight as f32 * opts.effective_feerate).ceil() as i64;
         self.waste =
             (self.weight as f32 * (opts.effective_feerate - opts.long_term_feerate)).ceil() as i64;
     }
-}
 
-#[cfg(feature = "std")]
-impl std::ops::Add for InputCandidate {
-    type Output = Self;
+    pub fn add_with(&mut self, other: &Self) -> &Self {
+        self.input_count += other.input_count;
+        self.segwit_count += other.segwit_count;
+        self.value += other.value;
+        self.weight += other.weight;
+        self.effective_value += other.effective_value;
+        self.waste += other.waste;
+        self
+    }
 
-    fn add(self, other: Self) -> Self {
-        Self {
-            input_count: self.input_count + other.input_count,
-            value: self.value + other.value,
-            weight: self.weight + other.weight,
-            is_segwit: self.is_segwit || other.is_segwit,
-
-            effective_value: self.effective_value + other.effective_value,
-            waste: self.waste + other.waste,
-        }
+    pub fn sub_with(&mut self, other: &Self) -> &Self {
+        self.input_count -= other.input_count;
+        self.segwit_count -= other.segwit_count;
+        self.value -= other.value;
+        self.weight -= other.weight;
+        self.effective_value -= other.effective_value;
+        self.waste -= other.waste;
+        self
     }
 }
 
@@ -265,7 +476,7 @@ impl CoinSelectorOpt {
 }
 
 impl<'a> CoinSelector<'a> {
-    pub fn new(candidates: &'a Vec<InputCandidate>, opts: &'a CoinSelectorOpt) -> Self {
+    pub fn new(candidates: &'a Vec<InputGroup>, opts: &'a CoinSelectorOpt) -> Self {
         let (unselected_value, unselected_effective_value) = candidates
             .iter()
             .map(|i| (i.value, i.effective_value))
@@ -289,11 +500,11 @@ impl<'a> CoinSelector<'a> {
         }
     }
 
-    pub fn candidates(&self) -> &[InputCandidate] {
+    pub fn candidates(&self) -> &[InputGroup] {
         &self.candidates
     }
 
-    pub fn candidate(&self, index: usize) -> &InputCandidate {
+    pub fn candidate(&self, index: usize) -> &InputGroup {
         assert!(index < self.candidates.len());
         &self.candidates[index]
     }
@@ -335,13 +546,13 @@ impl<'a> CoinSelector<'a> {
         self.opts.fixed_weight + inputs.weight + extra_witness_weight + extra_varint_weight
     }
 
-    pub fn iter_selected(&self) -> impl Iterator<Item = (usize, InputCandidate)> + '_ {
+    pub fn iter_selected(&self) -> impl Iterator<Item = (usize, InputGroup)> + '_ {
         self.selected_indexes
             .iter()
             .map(|&index| (index, self.candidates[index]))
     }
 
-    pub fn iter_unselected(&self) -> impl Iterator<Item = (usize, InputCandidate)> + '_ {
+    pub fn iter_unselected(&self) -> impl Iterator<Item = (usize, InputGroup)> + '_ {
         self.candidates
             .iter()
             .enumerate()
@@ -536,11 +747,10 @@ fn varint_size(v: usize) -> u32 {
 }
 
 /* ALGORITHMS */
+const MAX_MONEY: i64 = 2_100_000_000_000_000;
+const MAX_TRIES_BNB: usize = 100_000;
 
 pub fn select_coins_bnb(current: &mut CoinSelector) -> Result<Selection, SelectionFailure> {
-    const MAX_MONEY: i64 = 2_100_000_000_000_000;
-    const MAX_TRIES: usize = 100_000;
-
     let target_value = current.options().target_effective_value();
     let cost_of_change = current.options().drain_cost() as i64;
 
@@ -574,7 +784,7 @@ pub fn select_coins_bnb(current: &mut CoinSelector) -> Result<Selection, Selecti
     };
 
     // depth-first loop
-    for try_index in 0..MAX_TRIES {
+    for try_index in 0..MAX_TRIES_BNB {
         if try_index > 0 {
             pool_index += 1;
         }
@@ -650,6 +860,122 @@ pub fn select_coins_bnb(current: &mut CoinSelector) -> Result<Selection, Selecti
         {
             let best = best.as_ref().unwrap();
             best.state().waste + best.excess()
+        },
+        "waste does not match up"
+    );
+
+    Ok(selection)
+}
+
+pub fn select_coins_bnb2(common: &SelectorCommon) -> Result<Selection, SelectionFailure> {
+    let feerate_decreasing = common.is_feerate_decreasing();
+    let target_value = common.effective_target;
+    let change_cost = common.cost_of_change;
+
+    // remaining value of the current branch
+    let mut remaining_value = common
+        .candidate_inputs
+        .iter()
+        .map(|i| i.effective_value)
+        .sum::<i64>();
+
+    // ensure we have enough to select with
+    if remaining_value < target_value {
+        return Err(SelectionFailure::InsufficientFunds {
+            selected: remaining_value as _,
+            needed: target_value as _,
+        });
+    }
+
+    // current position
+    let mut pos = 0_usize;
+
+    // current selection
+    // sort candidates by effective value (descending)
+    // TODO: Should we filter candidates with negative effective values?
+    let mut current = Selector::new_sorted(common, |&(_, c1), &(_, c2)| {
+        c2.effective_value.cmp(&c1.effective_value)
+    });
+
+    // best selection
+    let mut best = Option::<Selector>::None;
+
+    // depth-fist loop
+    for try_index in 0..MAX_TRIES_BNB {
+        if try_index > 0 {
+            pos += 1;
+        }
+
+        // conditions for a backtrack
+        let backtrack = {
+            let current_value = current.state().effective_value;
+            let current_waste = current.state().waste;
+            let best_waste = best
+                .as_ref()
+                .map(|b| b.state().waste + b.excess(common))
+                .unwrap_or(MAX_MONEY);
+
+            if current_value + remaining_value < target_value
+                || current_value > target_value + change_cost
+                || (current.state().waste > best_waste && feerate_decreasing)
+            {
+                true
+            } else if current_value >= target_value {
+                if current_waste <= best_waste {
+                    best.replace(current.clone());
+                }
+                true
+            } else {
+                false
+            }
+        };
+
+        if backtrack {
+            let last_pos = match current.last_selected_position() {
+                Some(last_pos) => last_pos,
+                None => break, // nothing selected, all solutions search
+            };
+
+            (pos - 1..last_pos).for_each(|pos| {
+                remaining_value += current.candidate_at(common, pos).effective_value
+            });
+
+            current.deselect(common, last_pos);
+            pos = last_pos;
+        } else {
+            // continue down this branch
+            let candidate = current.candidate_at(common, pos);
+
+            // remove from remaining_value in branch
+            remaining_value -= candidate.effective_value;
+
+            // whether the previous position is selected
+            let prev_pos_selected = current
+                .last_selected_position()
+                .map(|last_selected_pos| last_selected_pos == pos - 1)
+                .unwrap_or(false);
+
+            if current.is_empty()
+                || prev_pos_selected
+                || candidate.effective_value
+                    != current.candidate_at(common, pos - 1).effective_value
+                || candidate.weight != current.candidate_at(common, pos - 1).weight
+            {
+                current.select(common, pos);
+            }
+        }
+    }
+
+    let selection = best
+        .as_ref()
+        .ok_or(SelectionFailure::NoSolution)?
+        .finish(common, change_cost)?;
+
+    assert_eq!(
+        selection.waste,
+        {
+            let best = best.as_ref().unwrap();
+            best.state().waste + best.excess(common)
         },
         "waste does not match up"
     );

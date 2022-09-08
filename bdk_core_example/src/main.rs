@@ -7,7 +7,7 @@ use bdk_core::{
         util::sighash::{Prevouts, SighashCache},
         Address, LockTime, Network, Sequence, Transaction, TxIn, TxOut,
     },
-    coin_select::{CoinSelector, CoinSelectorOpt, InputCandidate, TXIN_FIXED_WEIGHT},
+    coin_select::{CoinSelector, CoinSelectorOpt, InputGroup, TXIN_FIXED_WEIGHT},
     miniscript::{Descriptor, DescriptorPublicKey},
     ApplyResult, DescriptorExt, KeychainTracker, SparseChain,
 };
@@ -281,7 +281,7 @@ fn main() -> anyhow::Result<()> {
             let wv_candidates = candidates
                 .iter()
                 .map(|(plan, utxo)| {
-                    let mut candidate = InputCandidate::new_group(
+                    let mut candidate = InputGroup::new_group(
                         1,
                         utxo.value,
                         TXIN_FIXED_WEIGHT + plan.expected_weight() as u32,
