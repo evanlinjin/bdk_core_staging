@@ -121,12 +121,24 @@ impl Selector {
         }
     }
 
-    pub fn last_selected_position(&self) -> Option<usize> {
+    pub fn last_selected(&self) -> Option<usize> {
         self.selected.iter().last().cloned()
     }
 
-    pub fn position_selected(&self, pos: usize) -> bool {
+    pub fn is_selected(&self, pos: usize) -> bool {
         self.selected.contains(&pos)
+    }
+
+    pub fn iter_selected_positions(&self) -> impl Iterator<Item = usize> + '_ {
+        self.selected.iter().cloned()
+    }
+
+    pub fn iter_unselected_positions(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.candidates.len()).filter(|pos| !self.selected.contains(pos))
+    }
+
+    pub fn iter_selected<'c>(&'c self, common: &'c SelectorCommon) -> impl Iterator<Item = (usize, &'c InputGroup)> + 'c {
+        self.selected.iter().map(|pos| self.candidates[*pos]).map(|index| (index, &common.candidate_inputs[index]))
     }
 
     pub fn count(&self) -> usize {
@@ -147,10 +159,11 @@ impl Selector {
         self.selected_state.effective_value - common.effective_target
     }
 
+    /// Returns the current weight of the given selection.
     pub fn weight(&self, common: &SelectorCommon, include_drain: bool) -> u32 {
-        let has_segwit = self.has_segwit_input(common);
+        let is_segwit = self.is_segwit(common);
 
-        let extra_witness_weight = if has_segwit { 2_u32 } else { 0_u32 };
+        let extra_witness_weight = if is_segwit { 2_u32 } else { 0_u32 };
         let extra_varint_weight = self.extra_varint_weight(common);
         let fixed_inputs_weight = common.fixed_inputs.map(|i| i.weight).unwrap_or(0);
         let drain_weight = if include_drain {
@@ -171,7 +184,7 @@ impl Selector {
         self.candidates.len()
     }
 
-    pub fn candidate_at<'c>(&self, common: &'c SelectorCommon, pos: usize) -> &'c InputGroup {
+    pub fn candidate<'c>(&self, common: &'c SelectorCommon, pos: usize) -> &'c InputGroup {
         assert!(pos < self.candidates.len());
         assert_eq!(self.candidates.len(), common.candidate_inputs.len());
 
@@ -180,7 +193,7 @@ impl Selector {
     }
 
     /// Whether the current selection (inclusive of fixed inputs) contain at least one segwit input.
-    pub fn has_segwit_input(&self, common: &SelectorCommon) -> bool {
+    pub fn is_segwit(&self, common: &SelectorCommon) -> bool {
         let fixed_segwit_count = common.fixed_inputs.map(|i| i.segwit_count).unwrap_or(0);
         self.selected_state.segwit_count + fixed_segwit_count > 0
     }
@@ -234,10 +247,10 @@ impl Selector {
                 excess
             };
         let total_weight = self.weight(common, use_drain);
-        let excess = change_value.unwrap_or(excess);
         let fee = fixed_inputs.value + selected_inputs.value
             - common.opts.recipients_sum
             - change_value.unwrap_or(0) as u64;
+        let excess = excess - fee as i64;
 
         Ok(Selection {
             selected: self
@@ -931,35 +944,33 @@ pub fn select_coins_bnb2(common: &SelectorCommon) -> Result<Selection, Selection
         };
 
         if backtrack {
-            let last_pos = match current.last_selected_position() {
+            let last_pos = match current.last_selected() {
                 Some(last_pos) => last_pos,
                 None => break, // nothing selected, all solutions search
             };
 
-            (pos - 1..last_pos).for_each(|pos| {
-                remaining_value += current.candidate_at(common, pos).effective_value
-            });
+            (pos - 1..last_pos)
+                .for_each(|pos| remaining_value += current.candidate(common, pos).effective_value);
 
             current.deselect(common, last_pos);
             pos = last_pos;
         } else {
             // continue down this branch
-            let candidate = current.candidate_at(common, pos);
+            let candidate = current.candidate(common, pos);
 
             // remove from remaining_value in branch
             remaining_value -= candidate.effective_value;
 
             // whether the previous position is selected
             let prev_pos_selected = current
-                .last_selected_position()
+                .last_selected()
                 .map(|last_selected_pos| last_selected_pos == pos - 1)
                 .unwrap_or(false);
 
             if current.is_empty()
                 || prev_pos_selected
-                || candidate.effective_value
-                    != current.candidate_at(common, pos - 1).effective_value
-                || candidate.weight != current.candidate_at(common, pos - 1).weight
+                || candidate.effective_value != current.candidate(common, pos - 1).effective_value
+                || candidate.weight != current.candidate(common, pos - 1).weight
             {
                 current.select(common, pos);
             }
