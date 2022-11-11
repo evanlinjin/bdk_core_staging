@@ -256,7 +256,7 @@ impl Client {
                     empty_scripts = 0;
                 }
                 for tx in related_txs {
-                    if let Err(err) = update.insert_tx(tx.to_tx(), tx.status) {
+                    if let Err(err) = update.insert_tx(tx.to_tx(), tx.status.into()) {
                         match err {
                             InsertTxErr::TxTooHigh => {
                                 /* Don't care about new transactions confirmed while syncing */

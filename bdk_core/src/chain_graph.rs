@@ -2,11 +2,11 @@ use bitcoin::{OutPoint, Transaction, TxOut, Txid};
 use core::fmt::Debug;
 
 use crate::{
-    BlockId, ChainIndex, ChainIndexExtension, ChangeSet, InsertCheckpointErr, InsertTxErr,
-    SparseChain, TxGraph, UpdateFailure,
+    BlockId, ChainIndexExtension, ChangeSet, InsertCheckpointErr, InsertTxErr, SparseChain,
+    Timestamp, TxGraph, UpdateFailure,
 };
 
-pub type TimestampedChainGraph = ChainGraph<Option<u64>>;
+pub type TimestampedChainGraph = ChainGraph<Option<Timestamp>>;
 
 #[derive(Clone, Debug, Default)]
 pub struct ChainGraph<E = ()> {
@@ -15,33 +15,24 @@ pub struct ChainGraph<E = ()> {
 }
 
 impl<E: ChainIndexExtension> ChainGraph<E> {
-    pub fn insert_tx<I>(&mut self, tx: Transaction, index: I) -> Result<bool, InsertTxErr>
-    where
-        I: Into<ChainIndex<E>>,
-    {
+    pub fn insert_tx(&mut self, tx: Transaction, index: E::IntoIndex) -> Result<bool, InsertTxErr> {
         let changed = self.chain.insert_tx(tx.txid(), index)?;
         self.graph.insert_tx(&tx);
         Ok(changed)
     }
 
-    pub fn insert_output<I>(
+    pub fn insert_output(
         &mut self,
         outpoint: OutPoint,
         txout: TxOut,
-        index: I,
-    ) -> Result<bool, InsertTxErr>
-    where
-        I: Into<ChainIndex<E>>,
-    {
+        index: E::IntoIndex,
+    ) -> Result<bool, InsertTxErr> {
         let changed = self.chain.insert_tx(outpoint.txid, index)?;
         self.graph.insert_txout(outpoint, txout);
         Ok(changed)
     }
 
-    pub fn insert_txid<I>(&mut self, txid: Txid, index: I) -> Result<bool, InsertTxErr>
-    where
-        I: Into<ChainIndex<E>>,
-    {
+    pub fn insert_txid(&mut self, txid: Txid, index: E::IntoIndex) -> Result<bool, InsertTxErr> {
         self.chain.insert_tx(txid, index)
     }
 

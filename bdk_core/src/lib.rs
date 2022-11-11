@@ -61,6 +61,14 @@ pub mod collections {
     pub use core::ops::Bound;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Deserialize, serde::Serialize),
+    serde(crate = "serde_crate")
+)]
+pub struct Timestamp(pub u64);
+
 /// Represents the height in which a transaction is confirmed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(
@@ -121,10 +129,14 @@ impl TxHeight {
 )]
 pub struct ConfirmationTime {
     pub height: TxHeight,
-    pub time: Option<u64>,
+    pub time: Option<Timestamp>,
 }
 
 impl ConfirmationTime {
+    pub fn new(height: TxHeight, time: Option<Timestamp>) -> Self {
+        Self { height, time }
+    }
+
     pub fn is_confirmed(&self) -> bool {
         self.height.is_confirmed()
     }

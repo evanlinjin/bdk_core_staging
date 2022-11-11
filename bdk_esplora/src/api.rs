@@ -6,7 +6,7 @@ use bdk_core::{
         BlockHash, OutPoint, PackedLockTime, Script, Sequence, Transaction, TxIn, TxOut, Txid,
         Witness,
     },
-    BlockId, ConfirmationTime, PrevOuts, TimestampedChainIndex,
+    BlockId, ConfirmationTime, PrevOuts, Timestamp, TimestampedChainIndex,
 };
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -44,7 +44,7 @@ impl From<TxStatus> for ConfirmationTime {
     fn from(status: TxStatus) -> Self {
         Self {
             height: status.block_height.into(),
-            time: status.block_time,
+            time: status.block_time.map(Timestamp),
         }
     }
 }
@@ -53,7 +53,7 @@ impl From<TxStatus> for TimestampedChainIndex {
     fn from(status: TxStatus) -> Self {
         Self {
             height: status.block_height.into(),
-            extension: status.block_time,
+            extension: status.block_time.map(Timestamp),
         }
     }
 }

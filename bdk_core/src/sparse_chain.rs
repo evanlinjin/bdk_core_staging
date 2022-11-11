@@ -3,11 +3,11 @@ use core::{
     ops::{Bound, RangeBounds},
 };
 
-use crate::{collections::*, BlockId, ConfirmationTime, TxGraph, TxHeight, Vec};
+use crate::{collections::*, BlockId, ConfirmationTime, Timestamp, TxGraph, TxHeight, Vec};
 use bitcoin::{hashes::Hash, BlockHash, OutPoint, TxOut, Txid};
 
 /// A [`SparseChain`] in which the [`ChainIndex`] is extended by a timestamp.
-pub type TimestampedSparseChain = SparseChain<Option<u64>>;
+pub type TimestampedSparseChain = SparseChain<Option<Timestamp>>;
 
 /// This is a non-monotone structure that tracks relevant [`Txid`]s that are ordered by
 /// [`ChainIndex`].
@@ -227,10 +227,13 @@ impl<E: ChainIndexExtension> SparseChain<E> {
                 // avoid invalidating mempool txids for initial change-set
                 .range(
                     &(
-                        (TxHeight::Confirmed(invalid_from), E::MIN).into(),
+                        E::min_index_of_height(TxHeight::Confirmed(invalid_from)),
                         Txid::all_zeros(),
                     )
-                        ..&((TxHeight::Unconfirmed, E::MIN).into(), Txid::all_zeros()),
+                        ..&(
+                            E::min_index_of_height(TxHeight::Unconfirmed),
+                            Txid::all_zeros(),
+                        ),
                 )
                 .map(|(index, txid)| (*txid, Change::new_removal(*index)))
                 .collect(),
@@ -314,7 +317,12 @@ impl<E: ChainIndexExtension> SparseChain<E> {
     pub fn clear_mempool(&mut self) -> ChangeSet<E> {
         let txids = self
             .indexed_txids
-            .range(&((TxHeight::Unconfirmed, E::MIN).into(), Txid::all_zeros())..)
+            .range(
+                &(
+                    E::min_index_of_height(TxHeight::Unconfirmed),
+                    Txid::all_zeros(),
+                )..,
+            )
             .map(|(index, txid)| (*txid, Change::new_removal(*index)))
             .collect();
 
@@ -329,10 +337,7 @@ impl<E: ChainIndexExtension> SparseChain<E> {
 
     /// Insert an arbitary txid. This assumes that we have at least one checkpoint and the tx does
     /// not already exist in [`SparseChain`]. Returns a [`ChangeSet`] on success.
-    pub fn insert_tx<I>(&mut self, txid: Txid, index: I) -> Result<bool, InsertTxErr>
-    where
-        I: Into<ChainIndex<E>>,
-    {
+    pub fn insert_tx(&mut self, txid: Txid, index: E::IntoIndex) -> Result<bool, InsertTxErr> {
         let index: ChainIndex<E> = index.into();
 
         let latest = self
@@ -380,15 +385,14 @@ impl<E: ChainIndexExtension> SparseChain<E> {
         self.indexed_txids.iter().map(|(k, v)| (*k, *v))
     }
 
-    pub fn range_txids<I, R>(
+    pub fn range_txids<R>(
         &self,
         range: R,
     ) -> impl DoubleEndedIterator<Item = &(ChainIndex<E>, Txid)> + '_
     where
-        I: Into<ChainIndex<E>> + Copy,
-        R: RangeBounds<(I, Txid)>,
+        R: RangeBounds<(E::IntoIndex, Txid)>,
     {
-        let map_bound = |b: Bound<&(I, Txid)>| match b {
+        let map_bound = |b: Bound<&(E::IntoIndex, Txid)>| match b {
             Bound::Included(&(index, txid)) => Bound::Included((index.into(), txid)),
             Bound::Excluded(&(index, txid)) => Bound::Excluded((index.into(), txid)),
             Bound::Unbounded => Bound::Unbounded,
@@ -398,15 +402,14 @@ impl<E: ChainIndexExtension> SparseChain<E> {
             .range((map_bound(range.start_bound()), map_bound(range.end_bound())))
     }
 
-    pub fn range_txids_by_index<I, R>(
+    pub fn range_txids_by_index<R>(
         &self,
         range: R,
     ) -> impl DoubleEndedIterator<Item = &(ChainIndex<E>, Txid)> + '_
     where
-        I: Into<ChainIndex<E>> + Copy,
-        R: RangeBounds<I>,
+        R: RangeBounds<E::IntoIndex>,
     {
-        let map_bound = |b: Bound<&I>, inc: Txid, exc: Txid| match b {
+        let map_bound = |b: Bound<&E::IntoIndex>, inc: Txid, exc: Txid| match b {
             Bound::Included(&index) => Bound::Included((index.into(), inc)),
             Bound::Excluded(&index) => Bound::Excluded((index.into(), exc)),
             Bound::Unbounded => Bound::Unbounded,
@@ -426,8 +429,8 @@ impl<E: ChainIndexExtension> SparseChain<E> {
         R: RangeBounds<TxHeight>,
     {
         let map_bound = |b: Bound<&TxHeight>, inc: (E, Txid), exc: (E, Txid)| match b {
-            Bound::Included(&h) => Bound::Included(((h, inc.0).into(), inc.1)),
-            Bound::Excluded(&h) => Bound::Excluded(((h, exc.0).into(), exc.1)),
+            Bound::Included(&h) => Bound::Included((inc.0.index_of_height(h), inc.1)),
+            Bound::Excluded(&h) => Bound::Excluded((exc.0.index_of_height(h), exc.1)),
             Bound::Unbounded => Bound::Unbounded,
         };
 
@@ -679,30 +682,65 @@ pub trait ChainIndexExtension:
 {
     const MIN: Self;
     const MAX: Self;
-}
+    type IntoIndex: Into<ChainIndex<Self>> + Copy;
 
-impl<E: ChainIndexExtension> ChainIndexExtension for Option<E> {
-    const MIN: Self = None;
-    const MAX: Self = Some(E::MAX);
+    fn index_of_height(self, height: TxHeight) -> ChainIndex<Self> {
+        ChainIndex {
+            height,
+            extension: self,
+        }
+    }
+
+    fn min_index_of_height(height: TxHeight) -> ChainIndex<Self> {
+        Self::MIN.index_of_height(height)
+    }
+
+    fn max_index_of_height(height: TxHeight) -> ChainIndex<Self> {
+        Self::MAX.index_of_height(height)
+    }
 }
 
 impl ChainIndexExtension for () {
     const MIN: Self = ();
     const MAX: Self = ();
+    type IntoIndex = TxHeight;
 }
 
-impl ChainIndexExtension for u32 {
-    const MIN: Self = u32::MIN;
-    const MAX: Self = u32::MAX;
-}
-
-impl ChainIndexExtension for u64 {
-    const MIN: Self = u64::MIN;
-    const MAX: Self = u64::MAX;
+impl ChainIndexExtension for Option<Timestamp> {
+    const MIN: Self = None;
+    const MAX: Self = Some(Timestamp(u64::MAX));
+    type IntoIndex = ConfirmationTime;
 }
 
 /// [`ChainIndex`] that is extended by a timestamp.
-pub type TimestampedChainIndex = ChainIndex<Option<u64>>;
+pub type TimestampedChainIndex = ChainIndex<Option<Timestamp>>;
+
+impl From<ConfirmationTime> for TimestampedChainIndex {
+    fn from(conf: ConfirmationTime) -> Self {
+        Self {
+            height: conf.height,
+            extension: conf.time,
+        }
+    }
+}
+
+impl From<(TxHeight, Option<Timestamp>)> for TimestampedChainIndex {
+    fn from((height, timestamp): (TxHeight, Option<Timestamp>)) -> Self {
+        Self {
+            height,
+            extension: timestamp,
+        }
+    }
+}
+
+impl From<(TxHeight, Timestamp)> for TimestampedChainIndex {
+    fn from((height, timestamp): (TxHeight, Timestamp)) -> Self {
+        Self {
+            height,
+            extension: Some(timestamp),
+        }
+    }
+}
 
 /// Index in which transactions are ordered by in [`SparseChain`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -718,21 +756,6 @@ impl From<TxHeight> for ChainIndex {
         Self {
             height,
             extension: (),
-        }
-    }
-}
-
-impl<E: ChainIndexExtension> From<(TxHeight, E)> for ChainIndex<E> {
-    fn from((height, extension): (TxHeight, E)) -> Self {
-        Self { height, extension }
-    }
-}
-
-impl From<ConfirmationTime> for ChainIndex<Option<u64>> {
-    fn from(conf: ConfirmationTime) -> Self {
-        Self {
-            height: conf.height,
-            extension: conf.time,
         }
     }
 }
