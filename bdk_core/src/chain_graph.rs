@@ -5,6 +5,7 @@ use crate::{
 };
 use bitcoin::{OutPoint, Transaction, TxOut, Txid};
 use core::fmt::Debug;
+use std::collections::{HashMap, HashSet};
 
 /// A convenient combination of a [`SparseChain<I>`] and a [`TxGraph`].
 ///
@@ -101,6 +102,50 @@ impl<I: ChainIndex> ChainGraph<I> {
 
     /// Applies a [`ChangeSet`] to the chain graph
     pub fn apply_changeset(&mut self, changeset: ChangeSet<I>) {
+        // All txids in the changeset
+        let all_txids = changeset
+            .chain
+            .txids
+            .iter()
+            .map(|(txid, _)| *txid)
+            .collect::<HashSet<_>>();
+
+        // All txids that we previously knew about
+        let known_txid = changeset
+            .chain
+            .txids
+            .iter()
+            .filter_map(|(txid, _)| match self.chain.tx_index(*txid) {
+                Some(_) => Some(*txid),
+                None => None,
+            })
+            .collect::<HashSet<_>>();
+
+        // New txids in the changeset
+        let new_txid = all_txids.difference(&known_txid);
+
+        // Known txids should not have tx data in changeset
+        // Known txids should have tx data in self's graph
+        known_txid.iter().for_each(|txid| {
+            assert!(self.graph.contains_txid(*txid));
+            assert!(!changeset
+                .graph
+                .txids()
+                .collect::<HashMap<Txid, bool>>()
+                .contains_key(txid));
+        });
+
+        // New txids should not have tx data in self's graph
+        // New txid should have tx data in changeset
+        new_txid.for_each(|txid| {
+            assert!(!self.graph.contains_txid(*txid));
+            assert!(changeset
+                .graph
+                .txids()
+                .collect::<HashMap<Txid, bool>>()
+                .contains_key(txid));
+        });
+
         self.chain.apply_changeset(changeset.chain);
         self.graph.apply_additions(changeset.graph);
     }
