@@ -114,7 +114,7 @@ fn update_evicts_conflicting_tx() {
         cg
     };
     assert_eq!(
-        cg1.determine_changeset(&cg2),
+        cg1.determine_consistent_changeset(&cg2),
         Ok(ChangeSet::<TxHeight> {
             chain: sparse_chain::ChangeSet {
                 checkpoints: Default::default(),
@@ -149,7 +149,7 @@ fn update_evicts_conflicting_tx() {
         cg
     };
     assert_eq!(
-        cg1.determine_changeset(&cg2),
+        cg1.determine_consistent_changeset(&cg2),
         Err(sparse_chain::UpdateFailure::InconsistentTx {
             inconsistent_txid: tx_b.txid(),
             original_index: TxHeight::Confirmed(1),

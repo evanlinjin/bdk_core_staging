@@ -1,11 +1,11 @@
 use crate::{
     sparse_chain::{self, ChainIndex, SparseChain},
-    tx_graph::{self, TxGraph},
-    BlockId, ForEachTxout, FullTxOut, TxHeight,
+    tx_graph::{TxGraph},
+    BlockId, FullTxOut, TxHeight,
 };
+use alloc::vec::Vec;
 use bitcoin::{OutPoint, Transaction, TxOut, Txid};
 use core::fmt::Debug;
-use std::collections::{HashMap, HashSet};
 
 /// A convenient combination of a [`SparseChain<I>`] and a [`TxGraph`].
 ///
@@ -20,8 +20,8 @@ use std::collections::{HashMap, HashSet};
 /// from the graph.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChainGraph<I = TxHeight> {
-    pub chain: SparseChain<I>,
-    pub graph: TxGraph,
+    chain: SparseChain<I>,
+    graph: TxGraph,
 }
 
 impl<I> Default for ChainGraph<I> {
@@ -34,22 +34,66 @@ impl<I> Default for ChainGraph<I> {
 }
 
 impl<I: ChainIndex> ChainGraph<I> {
+    pub fn chain(&self) -> &SparseChain<I> {
+        &self.chain
+    }
+
+    pub fn graph(&self) -> &TxGraph {
+        &self.graph
+    }
+
+    pub fn mut_graph(&mut self) -> &mut TxGraph {
+        &mut self.graph
+    }
+
+    /// Given a list of txids, returns a list of txids that are missing from the internal graph.
+    pub fn determine_missing<'a>(
+        &'a self,
+        txids: impl Iterator<Item = Txid> + 'a,
+    ) -> impl Iterator<Item = Txid> + 'a {
+        txids.filter(|&txid| self.graph.tx(txid).is_none())
+    }
+
+    /// Inserts a transaction into the internal graph (and optionally the chain if `index` is
+    /// [`Some`]). Returns a tuple of booleans: `(<is_chain_updated>, <is_graph_updated>)`.
     pub fn insert_tx(
         &mut self,
         tx: Transaction,
-        index: I,
-    ) -> Result<bool, sparse_chain::InsertTxErr> {
-        let changed = self.chain.insert_tx(tx.txid(), index)?;
-        self.graph.insert_tx(tx);
-        Ok(changed)
+        index: Option<I>,
+    ) -> Result<(bool, bool), sparse_chain::InsertTxErr> {
+        let chain_updated = match index {
+            Some(index) => self.chain.insert_tx(tx.txid(), index)?,
+            None => false,
+        };
+
+        let graph_updated = self.graph.insert_tx(tx);
+
+        Ok((chain_updated, graph_updated))
+    }
+
+    /// Inserts a list of transactions, and returns a tuple recording modification counts of the 
+    /// internal chain and graph.
+    pub fn insert_txs(
+        &mut self,
+        tx_iter: impl Iterator<Item = (Transaction, Option<I>)>,
+    ) -> Result<(usize, usize), sparse_chain::InsertTxErr> {
+        tx_iter.try_fold(
+            (0, 0),
+            |(mut chain_changes, mut graph_changes), (tx, index)| {
+                let (chain_updated, graph_updated) = self.insert_tx(tx, index)?;
+                if chain_updated {
+                    chain_changes += 1;
+                }
+                if graph_updated {
+                    graph_changes += 1;
+                }
+                Ok((chain_changes, graph_changes))
+            },
+        )
     }
 
     pub fn insert_output(&mut self, outpoint: OutPoint, txout: TxOut) -> bool {
         self.graph.insert_txout(outpoint, txout)
-    }
-
-    pub fn insert_txid(&mut self, txid: Txid, index: I) -> Result<bool, sparse_chain::InsertTxErr> {
-        self.chain.insert_tx(txid, index)
     }
 
     pub fn insert_checkpoint(
@@ -59,29 +103,36 @@ impl<I: ChainIndex> ChainGraph<I> {
         self.chain.insert_checkpoint(block_id)
     }
 
-    /// Calculates the difference between self and `update` in the form of a [`ChangeSet`].
-    pub fn determine_changeset(
+    /// Calculates the difference between self and `update` in the form of a [`ChangeSet`], while
+    /// ensuring the histories of the update is consistent with the original chain.
+    /// 
+    /// It is assumed that the update chain is the most recent, and any transactions in the original
+    /// chain that conflicts the update is evicted.
+    /// 
+    /// TODO: Would it make sense for the changeset to use the same type as a sparse_chain?
+    pub fn determine_consistent_changeset(
         &self,
-        update: &Self,
-    ) -> Result<ChangeSet<I>, sparse_chain::UpdateFailure<I>> {
-        let (mut chain_changeset, invalid_from) = self.chain.determine_changeset(&update.chain)?;
+        update: &sparse_chain::SparseChain<I>,
+    ) -> Result<sparse_chain::ChangeSet<I>, sparse_chain::UpdateFailure<I>> {
+        let (mut changeset, invalid_from) = self.chain.determine_changeset(update)?;
         let invalid_from: TxHeight = invalid_from.into();
 
-        let conflicting_original_txids = update
-            .chain
+        let full_txs = update
             .iter_txids()
             // skip txids that already exist in the original chain (for efficiency)
             .filter(|&(_, txid)| self.chain.tx_index(*txid).is_none())
-            // skip txids that do not have full txs, as we can't check for conflicts for them
-            .filter_map(|&(_, txid)| update.graph.tx(txid).or_else(|| self.graph.tx(txid)))
-            // choose original txs that conflicts with the update
+            .map(|&(_, txid)| self.graph.tx(txid))
+            .collect::<Option<Vec<_>>>().ok_or(sparse_chain::UpdateFailure::MissingFullTxs)?;
+
+        let conflicting_txids = full_txs
+            .iter()
             .flat_map(|update_tx| {
                 self.graph
                     .conflicting_txids(update_tx)
                     .filter_map(|(_, txid)| self.chain.tx_index(txid).map(|i| (txid, i)))
             });
 
-        for (txid, original_index) in conflicting_original_txids {
+        for (txid, original_index) in conflicting_txids {
             // if the evicted txid lies before "invalid_from", we screwed up
             if original_index.height() < invalid_from {
                 return Err(sparse_chain::UpdateFailure::<I>::InconsistentTx {
@@ -91,63 +142,21 @@ impl<I: ChainIndex> ChainGraph<I> {
                 });
             }
 
-            chain_changeset.txids.insert(txid, None);
+            changeset.txids.insert(txid, None);
         }
 
-        Ok(ChangeSet::<I> {
-            chain: chain_changeset,
-            graph: self.graph.determine_additions(&update.graph),
-        })
+        Ok(changeset)
     }
 
     /// Applies a [`ChangeSet`] to the chain graph
-    pub fn apply_changeset(&mut self, changeset: ChangeSet<I>) {
-        // All txids in the changeset
-        let all_txids = changeset
-            .chain
-            .txids
-            .iter()
-            .map(|(txid, _)| *txid)
-            .collect::<HashSet<_>>();
+    pub fn apply_changeset(&mut self, changeset: sparse_chain::ChangeSet<I>) -> Result<(), Vec<Txid>> {
+        let missing = self.determine_missing(changeset.tx_additions()).collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(missing);
+        }
 
-        // All txids that we previously knew about
-        let known_txid = changeset
-            .chain
-            .txids
-            .iter()
-            .filter_map(|(txid, _)| match self.chain.tx_index(*txid) {
-                Some(_) => Some(*txid),
-                None => None,
-            })
-            .collect::<HashSet<_>>();
-
-        // New txids in the changeset
-        let new_txid = all_txids.difference(&known_txid);
-
-        // Known txids should not have tx data in changeset
-        // Known txids should have tx data in self's graph
-        known_txid.iter().for_each(|txid| {
-            assert!(self.graph.contains_txid(*txid));
-            assert!(!changeset
-                .graph
-                .txids()
-                .collect::<HashMap<Txid, bool>>()
-                .contains_key(txid));
-        });
-
-        // New txids should not have tx data in self's graph
-        // New txid should have tx data in changeset
-        new_txid.for_each(|txid| {
-            assert!(!self.graph.contains_txid(*txid));
-            assert!(changeset
-                .graph
-                .txids()
-                .collect::<HashMap<Txid, bool>>()
-                .contains_key(txid));
-        });
-
-        self.chain.apply_changeset(changeset.chain);
-        self.graph.apply_additions(changeset.graph);
+        self.chain.apply_changeset(changeset);
+        Ok(())
     }
 
     /// Applies the `update` chain graph. Note this is shorthand for calling [`determine_changeset`]
@@ -155,8 +164,8 @@ impl<I: ChainIndex> ChainGraph<I> {
     ///
     /// [`apply_changeset`]: Self::apply_changeset
     /// [`determine_changeset`]: Self::determine_changeset
-    pub fn apply_update(&mut self, update: Self) -> Result<(), sparse_chain::UpdateFailure<I>> {
-        let changeset = self.determine_changeset(&update)?;
+    pub fn apply_update(&mut self, update: sparse_chain::SparseChain<I>) -> Result<(), sparse_chain::UpdateFailure<I>> {
+        let changeset = self.determine_consistent_changeset(&update)?;
         self.apply_changeset(changeset);
         Ok(())
     }
@@ -174,40 +183,8 @@ impl<I: ChainIndex> ChainGraph<I> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize),
-    serde(crate = "serde_crate")
-)]
-pub struct ChangeSet<I> {
-    pub chain: sparse_chain::ChangeSet<I>,
-    pub graph: tx_graph::Additions,
-}
-
-impl<I> ChangeSet<I> {
-    pub fn is_empty(&self) -> bool {
-        self.chain.is_empty() && self.graph.is_empty()
-    }
-}
-
-impl<I> Default for ChangeSet<I> {
-    fn default() -> Self {
-        Self {
-            chain: Default::default(),
-            graph: Default::default(),
-        }
-    }
-}
-
 impl<I> AsRef<TxGraph> for ChainGraph<I> {
     fn as_ref(&self) -> &TxGraph {
         &self.graph
-    }
-}
-
-impl<I> ForEachTxout for ChangeSet<I> {
-    fn for_each_txout(&self, f: &mut impl FnMut((OutPoint, &TxOut))) {
-        self.graph.for_each_txout(f)
     }
 }

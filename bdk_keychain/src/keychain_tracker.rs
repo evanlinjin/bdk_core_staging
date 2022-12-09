@@ -41,7 +41,7 @@ where
 
         Ok(KeychainChangeSet {
             derivation_indices: new_derivation_indices,
-            chain_graph: self.chain_graph.determine_changeset(&scan.update)?,
+            chain_graph: self.chain_graph.determine_consistent_changeset(&scan.update)?,
         })
     }
 

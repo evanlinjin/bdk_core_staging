@@ -98,7 +98,7 @@ fn main() -> anyhow::Result<()> {
 
             let changeset = keychain_tracker
                 .chain_graph()
-                .determine_changeset(&scan)?
+                .determine_consistent_changeset(&scan)?
                 .into();
             db.append_changeset(&changeset)?;
             keychain_tracker.apply_changeset(changeset);

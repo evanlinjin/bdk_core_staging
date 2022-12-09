@@ -78,6 +78,7 @@ pub enum UpdateFailure<I = TxHeight> {
         original_index: I,
         update_index: Option<I>,
     },
+    MissingFullTxs,
 }
 
 impl<I: core::fmt::Debug> core::fmt::Display for UpdateFailure<I> {
@@ -89,6 +90,7 @@ impl<I: core::fmt::Debug> core::fmt::Display for UpdateFailure<I> {
             Self::InconsistentTx { inconsistent_txid, original_index, update_index } =>
                 write!(f, "inconsistent update: first inconsistent tx is ({}) which had index ({:?}), but is ({:?}) in the update", 
                     inconsistent_txid, original_index, update_index),
+            Self::MissingFullTxs => write!(f, "various transactions are missing"),
         }
     }
 }
