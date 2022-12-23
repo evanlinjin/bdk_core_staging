@@ -1,5 +1,17 @@
-use crate::collections::{BTreeSet, HashMap};
+#![no_std]
+
+#[cfg(feature = "std")]
+extern crate std;
+
+#[macro_use]
+extern crate alloc;
+extern crate bdk_core;
+
 use alloc::vec::Vec;
+use bdk_core::{
+    bitcoin,
+    collections::{BTreeSet, HashMap},
+};
 use bitcoin::{LockTime, Transaction, TxOut};
 use core::fmt::{Debug, Display};
 
