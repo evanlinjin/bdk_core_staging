@@ -119,8 +119,20 @@ where
         tracker: &mut KeychainTracker<K, P>,
     ) -> Result<(), IterError> {
         for changeset in self.iter_changesets()? {
-            tracker.apply_changeset(changeset?)
+            tracker.apply_changeset(changeset?);
         }
+        Ok(())
+    }
+
+    /// Functionally the same as [`Self::load_into_keychain_tracker`], however all changesets are
+    /// aggregated before loading into the tracker.
+    pub fn aggregate_load_into_keychain_tracker(
+        &mut self,
+        tracker: &mut KeychainTracker<K, P>,
+    ) -> Result<(), IterError> {
+        let (changeset, result) = self.aggregate_changeset();
+        result?;
+        tracker.apply_changeset(changeset);
         Ok(())
     }
 

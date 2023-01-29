@@ -1,20 +1,21 @@
-use std::collections::HashSet;
-use std::{net, thread};
+use std::{collections::HashSet, net, thread};
 
-use nakamoto::client::network::Services;
-use nakamoto::client::traits::Handle;
-use nakamoto::client::Handle as ClientHandle;
-use nakamoto::client::{chan, Client, Config, Domain, Event, Network};
-use nakamoto::net::poll;
+use nakamoto::{
+    client::{
+        chan, network::Services, traits::Handle, Client, Config, Domain, Event,
+        Handle as ClientHandle, Network,
+    },
+    net::poll,
+};
 
 use bdk_cli::{anyhow, Keychain};
 
-use bdk_chain::bitcoin::blockdata::script::Script;
-use bdk_chain::bitcoin::Transaction;
-use bdk_chain::chain_graph::ChainGraph;
-use bdk_chain::keychain::KeychainChangeSet;
-use bdk_chain::keychain::KeychainTracker;
-use bdk_chain::{BlockId, TxHeight};
+use bdk_chain::{
+    bitcoin::{blockdata::script::Script, Transaction},
+    chain_graph::ChainGraph,
+    keychain::{KeychainChangeSet, KeychainTracker},
+    BlockId, TxHeight,
+};
 
 type Reactor = poll::Reactor<net::TcpStream>;
 

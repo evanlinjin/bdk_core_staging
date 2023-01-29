@@ -545,7 +545,7 @@ where
 
     let mut db = KeychainStore::<Keychain, P>::new_from_path(args.db_path.as_path())?;
 
-    if let Err(e) = db.load_into_keychain_tracker(&mut tracker) {
+    if let Err(e) = db.aggregate_load_into_keychain_tracker(&mut tracker) {
         match tracker.chain().latest_checkpoint()  {
             Some(checkpoint) => eprintln!("Failed to load all changesets from {}. Last checkpoint was at height {}. Error: {}", args.db_path.display(), checkpoint.height, e),
             None => eprintln!("Failed to load any checkpoints from {}: {}", args.db_path.display(), e),

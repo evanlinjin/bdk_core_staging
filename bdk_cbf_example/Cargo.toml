@@ -13,4 +13,4 @@ log = "^0.4"
 env_logger = "0.7"
 
 # CBF
-nakamoto = { path = "../../../nakamoto" } #"0.4.0"
+nakamoto = "0.4.0"
