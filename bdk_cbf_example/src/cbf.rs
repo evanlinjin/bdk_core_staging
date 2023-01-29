@@ -36,6 +36,10 @@ impl CbfClient {
         let handle = client.handle();
         let client_recv = handle.events();
 
+        // let genesis = handle.get_block_by_height(0).expect("whattt").expect("should be there?");
+        // let hash = genesis.block_hash();
+        // println!("Genesis Block Hash: {}", hash);
+
         // Run the client on a different thread, to not block the main thread.
         thread::spawn(|| client.run(cfg).unwrap());
 
@@ -92,7 +96,9 @@ impl CbfClient {
                             }
                         }
                         Event::BlockConnected { height, .. } => {
-                            println!("Connected block with height {:?}", height);
+                            if height % 1000 == 0 {
+                                println!("Connected block with height {:?}", height);
+                            }
                         }
                         Event::BlockDisconnected { height, hash, .. } => {
                             println!("Disconnected block with height {:?}", height);
@@ -115,16 +121,17 @@ impl CbfClient {
                         Event::TxStatusChanged { .. } => {
                             println!("Tx status changed {:?}", &event);
                         }
-                        Event::FilterProcessed { matched, height, block, .. } => {
-                            let _ = update.insert_checkpoint(BlockId { height: height as u32, hash: block })?;
+                        Event::FilterProcessed { matched, height, block: hash, .. } => {
+                            let _ = update.insert_checkpoint(BlockId { height: height as u32, hash })?;
                             if height % 1000 == 0 {
                                 println!("Filter processed {}", height);
                             }
                             processed_height = height;
                             if matched {
                                 println!("Filter matched {:?}", &event);
-                                blocks_matched.insert(block);
+                                blocks_matched.insert(hash);
                             }
+
                             if processed_height == peer_height && blocks_matched.is_empty() {
                                 break;
                             }
@@ -138,9 +145,7 @@ impl CbfClient {
         let old_indexes = keychain_tracker.txout_index.derivation_indices();
 
         for (tx, _) in &txs {
-            keychain_tracker
-                .txout_index
-                .derive_until_unused_gap(stop_gap);
+            keychain_tracker.txout_index.pad_all_with_unused(stop_gap);
             keychain_tracker.txout_index.scan(tx);
         }
 
@@ -152,11 +157,12 @@ impl CbfClient {
             }
         }
 
+        // @evanlinjin: @danielabrozzoni, the culprit is here!
+        let new_indexes = keychain_tracker.txout_index.last_active_indicies();
+
         keychain_tracker
             .txout_index
             .prune_unused(old_indexes.clone());
-
-        let new_indexes = keychain_tracker.txout_index.last_active_indicies();
 
         let changeset = KeychainChangeSet {
             derivation_indices: keychain_tracker
@@ -180,7 +186,8 @@ impl CbfClient {
                 .determine_changeset(&update)?,
         };
 
-        dbg!(&changeset.chain_graph.graph.txout);
+        println!("changeset: {:#?}", changeset);
+        // dbg!(&changeset.chain_graph.graph.txout);
         Ok(changeset)
     }
 }

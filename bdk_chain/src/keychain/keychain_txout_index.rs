@@ -67,25 +67,6 @@ impl<K> Deref for KeychainTxOutIndex<K> {
 }
 
 impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
-    pub fn derive_until_unused_gap(&mut self, gap: u32) -> bool {
-        if gap == 0 {
-            return false;
-        }
-
-        let up_to_per_keychain = self
-            .keychains()
-            .iter()
-            .map(|(keychain, _)| {
-                let up_to = self
-                    .last_active_index(keychain)
-                    .unwrap_or(gap.saturating_sub(1));
-                (keychain.clone(), up_to)
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        self.store_all_up_to(&up_to_per_keychain)
-    }
-
     pub fn prune_unused(&mut self, mut keychain_bounds: BTreeMap<K, u32>) {
         for (keychain, _) in &self.keychains {
             keychain_bounds.entry(keychain.clone()).or_insert(0);
@@ -358,7 +339,7 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
         keychain: &K,
     ) -> impl DoubleEndedIterator<Item = (u32, OutPoint)> + '_ {
         self.inner
-            .outputs_in_range((keychain.clone(), u32::MIN)..(keychain.clone(), u32::MAX))
+            .outputs_in_range((keychain.clone(), u32::MIN)..=(keychain.clone(), u32::MAX))
             .map(|((_, i), op)| (*i, op))
     }
 

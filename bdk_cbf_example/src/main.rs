@@ -52,9 +52,7 @@ fn main() -> anyhow::Result<()> {
             // the database, but stop_gap + 1 scripts used on the blockchain: here
             // we derive until stop_gap, and you'll have to scan again before being
             // able to see the txs sent to the `stop_gap + 1`th script
-            keychain_tracker
-                .txout_index
-                .derive_until_unused_gap(stop_gap);
+            keychain_tracker.txout_index.pad_all_with_unused(stop_gap);
 
             //dbg!("Keychain tracker before everything: {:?}", &keychain_tracker);
             // TODO: too many collects here!

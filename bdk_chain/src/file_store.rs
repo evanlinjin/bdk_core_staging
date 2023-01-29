@@ -106,6 +106,8 @@ where
             Ok(())
         })();
 
+        println!("aggregate changeset: {:#?}", changeset.derivation_indices);
+
         (changeset, result)
     }
 
