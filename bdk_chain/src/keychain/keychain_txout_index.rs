@@ -227,9 +227,10 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
         &self,
         keychain: &K,
     ) -> impl DoubleEndedIterator<Item = (u32, &Script)> + Clone {
+        let (_, script_count) = self.keychains.get(keychain).expect("keychain must exist");
         self.inner
             .script_pubkeys()
-            .range(&(keychain.clone(), u32::MIN)..=&(keychain.clone(), u32::MAX))
+            .range(&(keychain.clone(), u32::MIN)..&(keychain.clone(), *script_count))
             .map(|((_, derivation_index), spk)| (*derivation_index, spk))
     }
 
@@ -282,7 +283,7 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
             current,
             self.inner
                 .script_pubkeys()
-                .range(&(keychain.clone(), u32::MIN)..=&(keychain.clone(), u32::MAX))
+                .range(&(keychain.clone(), u32::MIN)..&(keychain.clone(), *script_count))
                 .last()
                 .map(|((_, index), _)| *index)
         );
@@ -331,7 +332,7 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
         let mut last_derived = None;
 
         if target_count <= *index_count + lookahead {
-            last_derived = Some(target_count);
+            last_derived = Some(index);
         } else {
             for index in *index_count..target_count {
                 let spk = match descriptor
