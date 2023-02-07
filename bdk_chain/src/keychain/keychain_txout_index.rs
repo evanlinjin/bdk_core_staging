@@ -92,11 +92,8 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     ///
     /// [`ForEachTxout`]: crate::ForEachTxout
     pub fn scan(&mut self, txouts: &impl ForEachTxout) -> DerivationAdditions<K> {
-        let active_indices = self.inner.scan(txouts);
-        let mut additions = DerivationAdditions::default();
-        for (keychain, index) in active_indices {
-            additions.append(self.set_derivation_index(&keychain, index));
-        }
+        let mut additions = DerivationAdditions::<K>::default();
+        txouts.for_each_txout(&mut |(op, txout)| additions.append(self.scan_txout(op, txout)));
         additions
     }
 
@@ -104,11 +101,19 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
     ///
     /// If it matches the index will store and index it.
     pub fn scan_txout(&mut self, op: OutPoint, txout: &TxOut) -> DerivationAdditions<K> {
-        let mut additions = DerivationAdditions::default();
+        let secp = Secp256k1::verification_only();
         if let Some((keychain, index)) = self.inner.scan_txout(op, txout).cloned() {
-            additions.append(self.set_derivation_index(&keychain, index));
+            let (_, index_count) = self
+                .keychains
+                .get_mut(&keychain)
+                .expect("keychain must exist");
+            if index >= *index_count {
+                *index_count = index + 1;
+                self.replenish_lookahead(&secp, &keychain);
+                return DerivationAdditions([(keychain.clone(), index)].into());
+            }
         }
-        additions
+        return DerivationAdditions::default();
     }
 
     pub fn inner(&self) -> &SpkTxOutIndex<(K, u32)> {
